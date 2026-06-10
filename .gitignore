@@ -8,3 +8,7 @@ __pycache__
 dist
 build
 pipeline/.snapshots/
+
+# build artifacts
+*.tsbuildinfo
+next-env.d.ts
