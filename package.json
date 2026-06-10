@@ -1,0 +1,9 @@
+{
+  "name": "deedleague",
+  "private": true,
+  "packageManager": "pnpm@11.5.2",
+  "scripts": {
+    "dev": "pnpm --filter web dev",
+    "typecheck": "pnpm -r typecheck"
+  }
+}

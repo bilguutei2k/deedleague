@@ -1,0 +1,19 @@
+{
+  "name": "@deedleague/db",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.44",
+    "postgres": "^3"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "drizzle-kit": "^0.31",
+    "typescript": "^5"
+  }
+}

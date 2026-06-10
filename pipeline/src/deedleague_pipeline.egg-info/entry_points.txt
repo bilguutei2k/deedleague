@@ -1,0 +1,2 @@
+[console_scripts]
+deedleague-pipeline = pipeline.cli:main

@@ -1,0 +1,23 @@
+name: Incremental Refresh
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+
+jobs:
+  incremental:
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      CURRENT_SEASON_ID: ${{ secrets.CURRENT_SEASON_ID }}
+      MSPORTS_GRAPHQL_URL: ${{ vars.MSPORTS_GRAPHQL_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: TODO setup Python
+        run: echo "TODO: install Python 3.12 and pipeline dependencies"
+      - name: TODO run incremental refresh
+        run: echo "TODO: deedleague-pipeline --incremental"
