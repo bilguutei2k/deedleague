@@ -1,7 +1,8 @@
-"""Backfill orchestrator: client -> discovery -> scraper -> parser -> normalizer -> loader.
+"""Ingestion orchestrator: client -> discovery -> selection -> parser -> normalizer
+-> change-detection -> loader.
 
-Step 2 scope only (seed both seasons). Incremental selection, the completeness gate,
-and change detection are Step 3 — not implemented here.
+Modes (§7): backfill / full_resync fetch every game; incremental fetches only selected
+games (§7.3). Change detection (content_hash) decides load vs touch-last-fetched-only.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from .config import GRAPHQL_URL
 from .discovery import DiscoveredSeason, discover_schedule, discover_seasons
 from .normalizer import normalize_game
 from .parser import parse_game
+from .refresh import select_incremental
 from .rosters import TeamRosterCache
 
 
@@ -25,7 +27,7 @@ class GameResult:
     game_id: str
     season_id: str
     is_ended: bool
-    status: str  # loaded | failed
+    status: str  # loaded | unchanged | failed
     coverage: str  # full | partial | missing
     player_stat_rows: int
     parse_failures: int
@@ -37,6 +39,7 @@ class GameResult:
 @dataclass
 class BackfillSummary:
     seasons: list[DiscoveredSeason]
+    mode: str = "backfill"
     results: list[GameResult] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -87,36 +90,66 @@ def _classify(ng) -> tuple[str, str]:
     return "partial", note
 
 
-def run_backfill(progress: bool = True) -> BackfillSummary:
+def _select(
+    mode: str,
+    schedule: list,
+    existing: dict[str, dict],
+    game_ids: set[str] | None,
+) -> list:
+    if game_ids is not None:
+        return [g for g in schedule if g.id in game_ids]
+    if mode == "incremental":
+        return select_incremental(schedule, existing)
+    return list(schedule)  # backfill / full_resync: every game
+
+
+def run_ingest(
+    mode: str = "backfill",
+    season_ids: set[str] | None = None,
+    game_ids: set[str] | None = None,
+    progress: bool = True,
+) -> BackfillSummary:
     client = MsportsClient()
     session = db.Session()
     summary: BackfillSummary | None = None
     run_id: str | None = None
+    db_mode = {"backfill": "backfill", "incremental": "incremental", "full_resync": "full_resync"}.get(
+        mode, mode
+    )
     try:
         with session.conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO scrape_runs (mode, status) VALUES ('backfill', 'running') RETURNING id"
+                "INSERT INTO scrape_runs (mode, status) VALUES (%s, 'running') RETURNING id",
+                (db_mode,),
             )
             run_id = str(cur.fetchone()[0])
         session.conn.commit()
 
         seasons = discover_seasons(client)
+        if season_ids:
+            seasons = [s for s in seasons if s.id in season_ids]
         _seed_seasons(session.conn, seasons)
-        summary = BackfillSummary(seasons=seasons)
+        summary = BackfillSummary(seasons=seasons, mode=mode)
         roster_cache = TeamRosterCache(client)
+        existing = db.get_existing_games(session.conn)  # change detection + selection
 
         for s in seasons:
             schedule = discover_schedule(client, s.mens_division_id)
+            selected = _select(mode, schedule, existing, game_ids)
             if progress:
                 print(
-                    f"[{s.name}] men's division {s.mens_division_id}: {len(schedule)} games",
+                    f"[{s.name}] {s.mens_division_id}: schedule={len(schedule)} "
+                    f"selected={len(selected)} (mode={mode})",
                     file=sys.stderr,
                 )
-            for i, dg in enumerate(schedule, 1):
+            for i, dg in enumerate(selected, 1):
+                stored_hash = (existing.get(dg.id) or {}).get("content_hash")
                 # Retry once on a dropped connection (transient pooler disconnect).
                 for attempt in range(2):
                     try:
-                        res = _process_game(client, session, dg.id, s.id, roster_cache)
+                        res = _process_game(
+                            client, session, dg.id, s.id, roster_cache, stored_hash
+                        )
                         break
                     except psycopg.OperationalError as exc:
                         session.reset()
@@ -129,9 +162,16 @@ def run_backfill(progress: bool = True) -> BackfillSummary:
                                 note=f"connection lost: {exc}"[:200],
                             )
                 summary.results.append(res)
-                if progress and (i % 10 == 0 or i == len(schedule)):
+                if progress and (i % 10 == 0 or i == len(selected)):
                     full = sum(1 for r in summary.results if r.coverage == "full")
-                    print(f"  {s.name}: {i}/{len(schedule)} (full={full})", file=sys.stderr)
+                    print(f"  {s.name}: {i}/{len(selected)} (full={full})", file=sys.stderr)
+
+        # Recompute standings for every season touched (§7.9). Always safe to recompute;
+        # cheap and keeps the physical table consistent after any load.
+        from .statcalc import recompute_standings
+
+        for s in seasons:
+            recompute_standings(session.conn, s.id)
 
         checked = len(summary.results)
         changed = sum(1 for r in summary.results if r.status == "loaded")
@@ -148,12 +188,17 @@ def run_backfill(progress: bool = True) -> BackfillSummary:
         session.close()
 
 
+def run_backfill(progress: bool = True) -> BackfillSummary:
+    return run_ingest("backfill", progress=progress)
+
+
 def _process_game(
     client: MsportsClient,
     session: "db.Session",
     game_id: str,
     season_id: str,
     roster_cache: TeamRosterCache,
+    stored_hash: str | None = None,
 ) -> GameResult:
     variables = {"id": game_id}
     record_id: str | None = None
@@ -198,10 +243,28 @@ def _process_game(
                 note=f"completeness gate: {gate_reasons}",
             )
 
+        coverage, note = _classify(ng)
+
+        # Change detection: identical normalized payload → only bump last_fetched_at,
+        # write no normalized rows. Else load (delete-and-replace) + advance last_changed_at.
+        if stored_hash is not None and stored_hash == ng.content_hash:
+            db.touch_last_fetched(session.conn, game_id, record_id)
+            return GameResult(
+                game_id=game_id,
+                season_id=season_id,
+                is_ended=ng.is_ended,
+                status="unchanged",
+                coverage=coverage,
+                player_stat_rows=ng.player_stat_row_count,
+                parse_failures=ng.parse_failures,
+                orphan_athletes=len(ng.orphan_stat_athletes),
+                points_mismatch=ng.points_mismatch,
+                note=note,
+            )
+
         from .loader import load_game
 
         load_game(session.conn, ng, record_id, changed=True)
-        coverage, note = _classify(ng)
         return GameResult(
             game_id=game_id,
             season_id=season_id,

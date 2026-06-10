@@ -96,3 +96,35 @@ def set_load_status(conn: psycopg.Connection, source_record_id: str, status: str
             (status, source_record_id),
         )
     conn.commit()
+
+
+def get_existing_games(conn: psycopg.Connection) -> dict[str, dict]:
+    """game_id -> {is_ended, last_changed_at, date, content_hash} for selection + change
+    detection. Read once at the start of a run."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, is_ended, last_changed_at, date, content_hash FROM games"
+        )
+        return {
+            row[0]: {
+                "is_ended": row[1],
+                "last_changed_at": row[2],
+                "date": row[3],
+                "content_hash": row[4],
+            }
+            for row in cur.fetchall()
+        }
+
+
+def touch_last_fetched(conn: psycopg.Connection, game_id: str, source_record_id: str) -> None:
+    """Unchanged game: only bump last_fetched_at; do NOT touch normalized rows,
+    last_changed_at, or games.source_record_id (which points to the last loading fetch)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE games SET last_fetched_at = now() WHERE id = %s", (game_id,)
+        )
+        cur.execute(
+            "UPDATE source_records SET load_status = 'unchanged' WHERE id = %s",
+            (source_record_id,),
+        )
+    conn.commit()
