@@ -24,8 +24,8 @@ jobs:
       SNAPSHOT_ARTIFACT_NAME: raw-snapshots-${{ github.run_id }}-${{ github.run_attempt }}
       SNAPSHOT_URI_PREFIX: github-actions://${{ github.repository }}/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/artifacts/raw-snapshots-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -52,7 +52,7 @@ jobs:
           deedleague-pipeline --full-resync 2>&1 | tee "$RUNNER_TEMP/ingestion.log"
       - name: Retain raw snapshots
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.SNAPSHOT_ARTIFACT_NAME }}
           path: ${{ env.SNAPSHOT_DIR }}
@@ -61,7 +61,7 @@ jobs:
           compression-level: 9
       - name: Retain bounded run log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ingestion-log-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ingestion.log
@@ -70,7 +70,7 @@ jobs:
       - name: Alert on full-resync failure
         if: failure() || steps.configuration.outcome == 'failure' || steps.ingestion.outcome == 'failure'
         continue-on-error: true
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const title = '[ingestion] Full resync failed';
@@ -92,7 +92,7 @@ jobs:
       - name: Resolve full-resync failure alert
         if: success() && steps.configuration.outcome == 'success' && steps.ingestion.outcome == 'success'
         continue-on-error: true
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const title = '[ingestion] Full resync failed';
