@@ -4,6 +4,12 @@
   "packageManager": "pnpm@11.5.2",
   "scripts": {
     "dev": "pnpm --filter web dev",
+    "test:python": "PYTHONPATH=pipeline/src pipeline/.venv/bin/python -m unittest discover -s pipeline/tests -p 'test_pipeline.py' -v && PYTHONPATH=pipeline/src pipeline/.venv/bin/python pipeline/tests/test_golden.py",
+    "test:db": "tsx --test packages/db/tests/repositories.integration.ts",
+    "test:ts": "tsx --test packages/db/src/repositories/formula.test.ts packages/db/src/repositories/policy.test.ts packages/db/src/repositories/season.test.ts apps/web/lib/season.test.ts",
     "typecheck": "pnpm -r typecheck"
+  },
+  "devDependencies": {
+    "tsx": "^4.22.4"
   }
 }

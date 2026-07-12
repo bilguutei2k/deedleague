@@ -17,6 +17,12 @@ export function getDb() {
   return _db;
 }
 
+export async function closeDb(): Promise<void> {
+  if (_client) await _client.end();
+  _client = null;
+  _db = null;
+}
+
 // Proxy keeps the `db` import ergonomic while staying lazy.
 export const db = new Proxy({} as ReturnType<typeof drizzle>, {
   get(_t, prop) {

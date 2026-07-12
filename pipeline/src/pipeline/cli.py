@@ -8,7 +8,7 @@ import sys
 from collections import Counter
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="deedleague-pipeline")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--backfill", action="store_true", help="seed both approved seasons")
@@ -16,7 +16,7 @@ def main() -> None:
     mode.add_argument("--full-resync", action="store_true", help="re-fetch every game")
     parser.add_argument("--season", dest="seasons", action="append", help="restrict to season id(s)")
     parser.add_argument("--game", dest="games", action="append", help="restrict to game id(s)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.backfill:
         selected = "backfill"
@@ -27,17 +27,22 @@ def main() -> None:
     elif args.games or args.seasons:
         selected = "incremental"  # targeted run
     else:
-        print("No mode selected. Use --backfill | --incremental | --full-resync.")
-        return
+        parser.print_usage(sys.stderr)
+        print(
+            "deedleague-pipeline: error: no mode selected; use "
+            "--backfill, --incremental, or --full-resync",
+            file=sys.stderr,
+        )
+        return 2
 
-    _run(
+    return _run(
         selected,
         season_ids=set(args.seasons) if args.seasons else None,
         game_ids=set(args.games) if args.games else None,
     )
 
 
-def _run(mode: str, season_ids: set[str] | None, game_ids: set[str] | None) -> None:
+def _run(mode: str, season_ids: set[str] | None, game_ids: set[str] | None) -> int:
     from . import db
     from .report import standings_sanity_from_db, validate_golden_from_db
     from .scraper import run_ingest
@@ -63,10 +68,12 @@ def _run(mode: str, season_ids: set[str] | None, game_ids: set[str] | None) -> N
         print(f"  errors: {len(summary.errors)} (see scrape_runs / stderr)")
 
     # Golden + standings re-verification on full passes.
+    validation_failed = False
     if mode in ("backfill", "full_resync"):
         conn = db.connect()
         try:
             golden = validate_golden_from_db(conn)
+            validation_failed = not bool(golden["pass"])
             print("\n===== GOLDEN RECORD (J.Moss, from DB) =====")
             print(f"  got: {golden['got']}  -> {'PASS' if golden['pass'] else 'FAIL'}")
             for s in summary.seasons:
@@ -83,3 +90,7 @@ def _run(mode: str, season_ids: set[str] | None, game_ids: set[str] | None) -> N
         print("\n===== FAILED GAMES =====", file=sys.stderr)
         for r in failed[:50]:
             print(f"  {r.game_id}: {r.note}", file=sys.stderr)
+
+    if summary.status != "ok" or validation_failed:
+        return 1
+    return 0

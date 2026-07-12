@@ -22,6 +22,7 @@ class ActiveMember:
     name: str | None
     surname: str | None
     image: str | None
+    resolution: str = "active"
 
 
 def _date10(value: str | None) -> str | None:
@@ -70,6 +71,7 @@ class TeamRosterCache:
                     name=a.get("name"),
                     surname=a.get("surname"),
                     image=a.get("image"),
+                    resolution="fallback",
                 )
             )
         return members

@@ -2,6 +2,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { getGame, getBoxScore, getTerms, BOX_COLUMNS, pct1, num } from "@deedleague/db";
 import { displayName, fmtDate } from "@/lib/format";
+import { withSeason } from "@/lib/season";
 
 export const dynamic = "force-dynamic";
 
@@ -27,7 +28,7 @@ export default async function GamePage({ params }: { params: Promise<{ gameId: s
           {game.competitors.map((c, i) => (
             <span key={c.teamId} className="flex items-center gap-2">
               {i > 0 && <span className="text-gray-400">vs</span>}
-              <Link href={`/teams/${c.teamId}`} className="hover:underline">
+              <Link href={withSeason(`/teams/${c.teamId}`, game.seasonId)} className="hover:underline">
                 {c.name}
               </Link>
               <span className="tabular-nums">{c.points ?? "—"}</span>
@@ -55,12 +56,13 @@ export default async function GamePage({ params }: { params: Promise<{ gameId: s
               )}
             </h2>
             <table className="border-collapse text-sm">
+              <caption className="sr-only">{c.name} box score</caption>
               <thead>
                 <tr className="border-b border-gray-300 text-gray-500">
-                  <th className="px-2 py-1 text-left">#</th>
-                  <th className="px-2 py-1 text-left">Player</th>
+                  <th scope="col" className="px-2 py-1 text-left">#</th>
+                  <th scope="col" className="px-2 py-1 text-left">Player</th>
                   {BOX_COLUMNS.map((col) => (
-                    <th key={col.key} className="px-2 py-1 text-right">{col.label}</th>
+                    <th scope="col" key={col.key} className="px-2 py-1 text-right">{col.label}</th>
                   ))}
                 </tr>
               </thead>
@@ -69,7 +71,7 @@ export default async function GamePage({ params }: { params: Promise<{ gameId: s
                   <tr key={p.playerId} className="border-b border-gray-100">
                     <td className="px-2 py-1 tabular-nums text-gray-500">{p.number ?? "—"}</td>
                     <td className="px-2 py-1">
-                      <Link href={`/players/${p.playerId}`} className="hover:underline">
+                      <Link href={withSeason(`/players/${p.playerId}`, game.seasonId)} className="hover:underline">
                         {displayName(p.name, p.surname)}
                       </Link>
                     </td>

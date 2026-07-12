@@ -7,6 +7,8 @@ games (§7.3). Change detection (content_hash) decides load vs touch-last-fetche
 
 from __future__ import annotations
 
+import json
+import re
 import sys
 from dataclasses import dataclass, field
 
@@ -32,6 +34,8 @@ class GameResult:
     player_stat_rows: int
     parse_failures: int
     orphan_athletes: int
+    fallback_athletes: int
+    unknown_stat_terms: int
     points_mismatch: bool
     note: str = ""
 
@@ -42,6 +46,109 @@ class BackfillSummary:
     mode: str = "backfill"
     results: list[GameResult] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    status: str = "running"
+
+
+_URL_CREDENTIALS = re.compile(r"(postgres(?:ql)?://)[^@\s]+@", re.IGNORECASE)
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)(password|passwd|token|secret|api[_-]?key)\s*[=:]\s*[^\s,;]+"
+)
+
+
+def _safe_error(exc: BaseException | str, limit: int = 300) -> str:
+    """Return a concise error suitable for durable run notes."""
+    text = str(exc).replace("\n", " ").strip()
+    text = _URL_CREDENTIALS.sub(r"\1<redacted>@", text)
+    text = _SECRET_ASSIGNMENT.sub(r"\1=<redacted>", text)
+    return text[:limit]
+
+
+def _quality_issues(result: GameResult) -> list[str]:
+    issues: list[str] = []
+    if result.parse_failures:
+        issues.append(f"parse_failures={result.parse_failures}")
+    if result.orphan_athletes:
+        issues.append(f"orphan_athletes={result.orphan_athletes}")
+    if result.fallback_athletes:
+        issues.append(f"fallback_athletes={result.fallback_athletes}")
+    if result.unknown_stat_terms:
+        issues.append(f"unknown_stat_terms={result.unknown_stat_terms}")
+    if result.points_mismatch:
+        issues.append("points_mismatch")
+    if result.is_ended and result.coverage != "full":
+        issues.append(f"ended_game_coverage={result.coverage}")
+    return issues
+
+
+def _summary_status(summary: BackfillSummary) -> str:
+    if summary.errors or any(r.status == "failed" for r in summary.results):
+        return "partial"
+    if any(_quality_issues(r) for r in summary.results):
+        return "partial"
+    return "ok"
+
+
+def _summary_notes(summary: BackfillSummary) -> str | None:
+    failed = [
+        {"game_id": r.game_id, "error": _safe_error(r.note)}
+        for r in summary.results
+        if r.status == "failed"
+    ]
+    quality = [
+        {"game_id": r.game_id, "issues": _quality_issues(r)}
+        for r in summary.results
+        if r.status != "failed" and _quality_issues(r)
+    ]
+    payload = {
+        "failed_count": len(failed),
+        "quality_issue_count": len(quality),
+        "failed_games": failed[:10],
+        "quality_issues": quality[:10],
+        "errors": [_safe_error(error, limit=200) for error in summary.errors[:10]],
+    }
+    if not failed and not quality and not summary.errors:
+        return None
+    return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+
+
+def _normalized_quality_issues(ng, coverage: str) -> list[str]:
+    issues: list[str] = []
+    if ng.parse_failures:
+        issues.append(f"parse failures: {ng.parse_failures}")
+    if ng.orphan_stat_athletes:
+        issues.append(f"orphan stat athletes: {len(ng.orphan_stat_athletes)}")
+    if ng.fallback_resolved_athletes:
+        issues.append(f"roster fallback athletes: {len(ng.fallback_resolved_athletes)}")
+    if ng.unknown_stat_terms:
+        issues.append(f"unknown stat terms: {len(ng.unknown_stat_terms)}")
+    if ng.points_mismatch:
+        issues.append("official score does not match stat-derived points")
+    if ng.is_ended and coverage != "full":
+        issues.append(f"ended game has {coverage} box-score coverage")
+    return issues
+
+
+def _rollback_for_finalization(session: "db.Session") -> None:
+    try:
+        session.conn.rollback()
+    except Exception:
+        session.reset()
+
+
+def _finalize_run(
+    session: "db.Session",
+    run_id: str,
+    summary: BackfillSummary,
+    status: str,
+) -> None:
+    db.finalize_scrape_run(
+        session.conn,
+        run_id,
+        status=status,
+        games_checked=len(summary.results),
+        games_changed=sum(1 for r in summary.results if r.status == "loaded"),
+        notes=_summary_notes(summary),
+    )
 
 
 def _seed_seasons(conn: psycopg.Connection, seasons: list[DiscoveredSeason]) -> None:
@@ -77,6 +184,8 @@ def completeness_gate(ng) -> tuple[bool, str]:
         reasons.append("missing two team score nodes")
     if not ng.has_terms:
         reasons.append("missing term dictionary")
+    if ng.unknown_stat_terms:
+        reasons.append(f"unknown stat terms ({len(ng.unknown_stat_terms)})")
     if not ng.has_roster:
         reasons.append("missing roster")
     return (len(reasons) == 0, "; ".join(reasons))
@@ -117,13 +226,7 @@ def run_ingest(
         mode, mode
     )
     try:
-        with session.conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO scrape_runs (mode, status) VALUES (%s, 'running') RETURNING id",
-                (db_mode,),
-            )
-            run_id = str(cur.fetchone()[0])
-        session.conn.commit()
+        run_id = db.create_scrape_run(session.conn, db_mode)
 
         seasons = discover_seasons(client)
         if season_ids:
@@ -154,12 +257,14 @@ def run_ingest(
                     except psycopg.OperationalError as exc:
                         session.reset()
                         if attempt == 1:
-                            summary.errors.append(f"{dg.id}: connection lost: {exc}")
+                            error = _safe_error(exc)
+                            summary.errors.append(f"{dg.id}: connection lost: {error}")
                             res = GameResult(
                                 game_id=dg.id, season_id=s.id, is_ended=False,
                                 status="failed", coverage="missing", player_stat_rows=0,
-                                parse_failures=0, orphan_athletes=0, points_mismatch=False,
-                                note=f"connection lost: {exc}"[:200],
+                                parse_failures=0, orphan_athletes=0, fallback_athletes=0,
+                                unknown_stat_terms=0, points_mismatch=False,
+                                note=f"connection lost: {error}"[:200],
                             )
                 summary.results.append(res)
                 if progress and (i % 10 == 0 or i == len(selected)):
@@ -173,16 +278,25 @@ def run_ingest(
         for s in seasons:
             recompute_standings(session.conn, s.id)
 
-        checked = len(summary.results)
-        changed = sum(1 for r in summary.results if r.status == "loaded")
-        with session.conn.cursor() as cur:
-            cur.execute(
-                "UPDATE scrape_runs SET finished_at = now(), games_checked = %s, "
-                "games_changed = %s, status = %s WHERE id = %s",
-                (checked, changed, "ok" if not summary.errors else "partial", run_id),
-            )
-        session.conn.commit()
+        summary.status = _summary_status(summary)
+        _finalize_run(session, run_id, summary, summary.status)
         return summary
+    except Exception as exc:
+        if summary is None:
+            summary = BackfillSummary(seasons=[], mode=mode)
+        summary.status = "failed"
+        summary.errors.append(f"{type(exc).__name__}: {_safe_error(exc)}")
+        if run_id is not None:
+            _rollback_for_finalization(session)
+            try:
+                _finalize_run(session, run_id, summary, "failed")
+            except Exception as finalize_exc:
+                print(
+                    "Failed to finalize scrape run "
+                    f"{run_id}: {type(finalize_exc).__name__}: {_safe_error(finalize_exc)}",
+                    file=sys.stderr,
+                )
+        raise
     finally:
         client.close()
         session.close()
@@ -239,16 +353,27 @@ def _process_game(
                 player_stat_rows=ng.player_stat_row_count,
                 parse_failures=ng.parse_failures,
                 orphan_athletes=len(ng.orphan_stat_athletes),
+                fallback_athletes=len(ng.fallback_resolved_athletes),
+                unknown_stat_terms=len(ng.unknown_stat_terms),
                 points_mismatch=ng.points_mismatch,
                 note=f"completeness gate: {gate_reasons}",
             )
 
         coverage, note = _classify(ng)
+        quality_issues = _normalized_quality_issues(ng, coverage)
+        if quality_issues:
+            note = "; ".join(filter(None, [note, *quality_issues]))
+        load_status = "partial" if quality_issues else "loaded"
 
         # Change detection: identical normalized payload → only bump last_fetched_at,
         # write no normalized rows. Else load (delete-and-replace) + advance last_changed_at.
         if stored_hash is not None and stored_hash == ng.content_hash:
-            db.touch_last_fetched(session.conn, game_id, record_id)
+            db.touch_last_fetched(
+                session.conn,
+                game_id,
+                record_id,
+                load_status="partial" if quality_issues else "unchanged",
+            )
             return GameResult(
                 game_id=game_id,
                 season_id=season_id,
@@ -258,13 +383,15 @@ def _process_game(
                 player_stat_rows=ng.player_stat_row_count,
                 parse_failures=ng.parse_failures,
                 orphan_athletes=len(ng.orphan_stat_athletes),
+                fallback_athletes=len(ng.fallback_resolved_athletes),
+                unknown_stat_terms=len(ng.unknown_stat_terms),
                 points_mismatch=ng.points_mismatch,
                 note=note,
             )
 
         from .loader import load_game
 
-        load_game(session.conn, ng, record_id, changed=True)
+        load_game(session.conn, ng, record_id, changed=True, load_status=load_status)
         return GameResult(
             game_id=game_id,
             season_id=season_id,
@@ -274,6 +401,8 @@ def _process_game(
             player_stat_rows=ng.player_stat_row_count,
             parse_failures=ng.parse_failures,
             orphan_athletes=len(ng.orphan_stat_athletes),
+            fallback_athletes=len(ng.fallback_resolved_athletes),
+            unknown_stat_terms=len(ng.unknown_stat_terms),
             points_mismatch=ng.points_mismatch,
             note=note,
         )
@@ -297,6 +426,8 @@ def _process_game(
             player_stat_rows=0,
             parse_failures=0,
             orphan_athletes=0,
+            fallback_athletes=0,
+            unknown_stat_terms=0,
             points_mismatch=False,
-            note=f"{type(exc).__name__}: {exc}"[:200],
+            note=f"{type(exc).__name__}: {_safe_error(exc)}"[:200],
         )

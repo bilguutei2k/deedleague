@@ -14,7 +14,7 @@ from typing import Any
 
 import httpx
 
-from .config import GRAPHQL_URL, PolitenessConfig, snapshot_dir
+from .config import GRAPHQL_URL, PolitenessConfig, snapshot_dir, snapshot_uri_prefix
 
 
 class MsportsClient:
@@ -90,12 +90,15 @@ class MsportsClient:
         query: str,
         snapshot_label: str,
     ) -> tuple[dict[str, Any], str]:
-        """Fetch + persist the raw response to disk. Returns (payload, snapshot_path)."""
+        """Fetch locally and return its local path or configured durable reference."""
         payload = self.post_graphql(operation_name, variables, query)
         ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        unique_suffix = time.time_ns()
         out_dir = os.path.abspath(snapshot_dir())
         os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, f"{snapshot_label}_{ts}.json")
+        filename = f"{snapshot_label}_{ts}_{unique_suffix}.json"
+        path = os.path.join(out_dir, filename)
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False)
-        return payload, path
+        prefix = snapshot_uri_prefix()
+        return payload, f"{prefix}/{filename}" if prefix else path
