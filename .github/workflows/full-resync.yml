@@ -5,19 +5,110 @@ on:
     - cron: "0 2 * * 0"
   workflow_dispatch:
 
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: deedleague-ingestion
+  cancel-in-progress: false
+
 jobs:
-  full-resync:
+  ingest:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     env:
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      CURRENT_SEASON_ID: ${{ secrets.CURRENT_SEASON_ID }}
-      MSPORTS_GRAPHQL_URL: ${{ vars.MSPORTS_GRAPHQL_URL }}
+      PIPELINE_DATABASE_URL: ${{ secrets.PIPELINE_DATABASE_URL }}
+      MSPORTS_GRAPHQL_URL: ${{ vars.MSPORTS_GRAPHQL_URL || 'https://stats-api.msports.mn/graphql' }}
+      SNAPSHOT_DIR: ${{ github.workspace }}/pipeline/.snapshots
+      SNAPSHOT_ARTIFACT_NAME: raw-snapshots-${{ github.run_id }}-${{ github.run_attempt }}
+      SNAPSHOT_URI_PREFIX: github-actions://${{ github.repository }}/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/artifacts/raw-snapshots-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
-      - name: TODO setup Python
-        run: echo "TODO: install Python 3.12 and pipeline dependencies"
-      - name: TODO run full resync
-        run: echo "TODO: deedleague-pipeline --full-resync"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pipeline/requirements.lock
+      - name: Install locked pipeline
+        run: |
+          python -m pip install --requirement pipeline/requirements.lock
+          python -m pip install --no-deps --editable pipeline
+      - name: Validate production configuration
+        id: configuration
+        continue-on-error: true
+        run: |
+          if [ -z "$PIPELINE_DATABASE_URL" ]; then
+            echo "::error title=Missing secret::PIPELINE_DATABASE_URL is not configured."
+            exit 1
+          fi
+          mkdir -p "$SNAPSHOT_DIR"
+      - name: Run full resync
+        if: steps.configuration.outcome == 'success'
+        id: ingestion
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          deedleague-pipeline --full-resync 2>&1 | tee "$RUNNER_TEMP/ingestion.log"
+      - name: Retain raw snapshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SNAPSHOT_ARTIFACT_NAME }}
+          path: ${{ env.SNAPSHOT_DIR }}
+          if-no-files-found: warn
+          retention-days: 90
+          compression-level: 9
+      - name: Retain bounded run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingestion-log-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ingestion.log
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Alert on full-resync failure
+        if: failure() || steps.configuration.outcome == 'failure' || steps.ingestion.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = '[ingestion] Full resync failed';
+            const body = `Full resync failed.\n\nRun: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo, state: 'open', per_page: 100,
+            });
+            const existing = issues.data.find((issue) => issue.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo, title, body,
+              });
+            }
+      - name: Resolve full-resync failure alert
+        if: success() && steps.configuration.outcome == 'success' && steps.ingestion.outcome == 'success'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = '[ingestion] Full resync failed';
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo, state: 'open', per_page: 100,
+            });
+            for (const issue of issues.data.filter((item) => item.title === title)) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issue.number, body: `Recovered in run ${context.runId}.`,
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issue.number, state: 'closed',
+              });
+            }
+      - name: Propagate ingestion failure
+        if: steps.configuration.outcome == 'failure' || steps.ingestion.outcome == 'failure'
+        run: exit 1

@@ -1,11 +1,16 @@
-name: Deploy
+name: Deploy (inactive)
 
 on:
   workflow_dispatch:
 
 jobs:
-  deploy:
+  inactive:
     runs-on: ubuntu-latest
+    timeout-minutes: 1
+    permissions:
+      contents: read
     steps:
-      - name: TODO Vercel deploy
-        run: echo "TODO: wire Vercel deployment"
+      - name: Explain why deployment is inactive
+        run: |
+          echo "::error title=Inactive deployment::No Vercel project ownership, project IDs, or deployment token are configured."
+          exit 1
