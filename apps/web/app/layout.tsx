@@ -23,7 +23,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         </header>
         <main className="mx-auto max-w-5xl px-4 py-6">{children}</main>
         <footer className="mx-auto max-w-5xl px-4 py-8 text-xs text-gray-400">
-          Read-only. Source: msports. Structural preview — visual design pending.
+          Read-only analytics. Source: msports.
         </footer>
       </body>
     </html>

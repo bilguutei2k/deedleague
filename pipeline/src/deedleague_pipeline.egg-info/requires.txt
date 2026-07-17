@@ -1,4 +1,0 @@
-httpx
-pydantic
-psycopg[binary]
-python-dotenv

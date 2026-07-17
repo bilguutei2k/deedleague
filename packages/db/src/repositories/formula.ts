@@ -102,6 +102,7 @@ export function computeLine(
 }
 
 // Ordered box-score / line columns (uniqueName -> label). 3P%/2P% have no term, omitted.
+// BKST_FGA is the upstream identifier (including its spelling) for the derived FGA term.
 export const BOX_COLUMNS: { key: string; label: string; pct?: boolean }[] = [
   { key: "BSKT_PTS", label: "PTS" },
   { key: "BSKT_FGM", label: "FGM" },

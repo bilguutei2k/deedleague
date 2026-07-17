@@ -5,8 +5,17 @@ import { sql } from "drizzle-orm";
 
 import { db } from "../client";
 import { BOX_COLUMNS, computeLine, type Term } from "./formula";
+import {
+  getLeaderEligibility,
+  LEADER_CATEGORIES,
+  type LeaderCategorySpec,
+  type LeaderEligibility,
+} from "./policy";
+import { resolveSeasonId, type SeasonResolution } from "./season";
 
 export * from "./formula";
+export * from "./policy";
+export * from "./season";
 
 async function q<T = Record<string, unknown>>(query: ReturnType<typeof sql>): Promise<T[]> {
   const rows = await db.execute(query);
@@ -30,11 +39,20 @@ export async function getSeasons(): Promise<Season[]> {
     FROM seasons ORDER BY start_date DESC NULLS LAST`);
 }
 
-export async function getCurrentSeasonId(): Promise<string> {
-  const override = process.env.CURRENT_SEASON_ID;
-  if (override) return override;
+export async function getCurrentSeasonId(): Promise<string | null> {
   const rows = await getSeasons();
-  return rows[0]?.id;
+  return resolveSeasonId(rows, undefined, process.env.CURRENT_SEASON_ID).seasonId;
+}
+
+export async function getSeasonContext(requested?: string): Promise<{
+  seasons: Season[];
+  resolution: SeasonResolution;
+}> {
+  const seasons = await getSeasons();
+  return {
+    seasons,
+    resolution: resolveSeasonId(seasons, requested, process.env.CURRENT_SEASON_ID),
+  };
 }
 
 // ---------------------------------------------------------------- standings
@@ -54,13 +72,14 @@ export async function getStandings(seasonId: string): Promise<StandingRow[]> {
 
 // ---------------------------------------------------------------- coverage badge
 
-export type Coverage = { full: number; partial: number; missing: number; lastUpdated: string | null };
+export type Coverage = { full: number; partial: number; lastUpdated: string | null };
 
 export async function getCoverage(seasonId: string): Promise<Coverage> {
   // A competitor has a real box score iff it has points present AND either points=0 or
   // recorded made-shots (a team with a score but zero made-shots is a one-sided source
   // gap -> partial). full = both competitors box-score-complete; otherwise partial.
-  // missing = scheduled game with no snapshot loaded (none in the current DB set).
+  // This intentionally reports only ingested records. Expected/missing games cannot be
+  // calculated until schedule identities are persisted independently of loaded games.
   const rows = await q<{ ok_teams: number; n: number }>(sql`
     SELECT ok_teams, COUNT(*)::int AS n FROM (
       SELECT g.id,
@@ -80,7 +99,7 @@ export async function getCoverage(seasonId: string): Promise<Coverage> {
   }
   const upd = await q<{ ts: string | null }>(sql`
     SELECT MAX(finished_at)::text AS ts FROM scrape_runs WHERE status IN ('ok','partial')`);
-  return { full, partial, missing: 0, lastUpdated: upd[0]?.ts ?? null };
+  return { full, partial, lastUpdated: upd[0]?.ts ?? null };
 }
 
 // ---------------------------------------------------------------- recent results
@@ -100,57 +119,74 @@ export async function getRecentResults(seasonId: string, limit = 10): Promise<Re
     JOIN game_competitors b ON b.game_id = g.id AND b.competitor_order = 1
     JOIN teams ta ON ta.id = a.team_id
     JOIN teams tb ON tb.id = b.team_id
-    WHERE g.season_id = ${seasonId} AND g.is_ended = true AND a.points IS NOT NULL
+    WHERE g.season_id = ${seasonId} AND g.is_ended = true
+      AND a.points IS NOT NULL AND b.points IS NOT NULL
     ORDER BY g.date DESC LIMIT ${limit}`);
 }
 
 // ---------------------------------------------------------------- leaders
 
 export type LeaderRow = { playerId: string; name: string; surname: string | null; value: number; games: number; extra?: string };
-export type Leaders = { category: string; label: string; rows: LeaderRow[] }[];
+export type LeaderCategory = { category: string; label: string; rows: LeaderRow[] };
+export type Leaders = { categories: LeaderCategory[]; eligibility: LeaderEligibility };
 
-async function countingLeader(seasonId: string, uniqueName: string, limit: number): Promise<LeaderRow[]> {
-  // per-game average over statted games; no minimum threshold (§9).
+async function weightedLeader(
+  seasonId: string,
+  spec: LeaderCategorySpec,
+  minimumGames: number,
+  limit: number,
+): Promise<LeaderRow[]> {
+  const valueExpression = sql.join(
+    spec.terms.map(
+      (term) => sql`CASE WHEN st.unique_name = ${term.uniqueName}
+                         THEN s.value * ${term.weight} ELSE 0 END`,
+    ),
+    sql` + `,
+  );
+
+  // A recorded appearance is a player/game with any player-stat event. The source roster
+  // is broader and does not distinguish DNPs from players who participated with zero in a
+  // category. Category totals are therefore left-joined and zero-filled over appearances.
   return q<LeaderRow>(sql`
-    SELECT s.player_id AS "playerId", p.name, p.surname,
-      ROUND(SUM(s.value)::numeric / COUNT(DISTINCT s.game_id), 1)::float AS value,
-      COUNT(DISTINCT s.game_id)::int AS games
-    FROM game_player_stats s
-    JOIN stat_terms st ON st.id = s.term_id
-    JOIN games g ON g.id = s.game_id
-    JOIN players p ON p.id = s.player_id
-    WHERE g.season_id = ${seasonId} AND st.unique_name = ${uniqueName}
-    GROUP BY s.player_id, p.name, p.surname
+    WITH appearances AS (
+      SELECT DISTINCT s.player_id, s.game_id
+      FROM game_player_stats s
+      JOIN games g ON g.id = s.game_id
+      WHERE g.season_id = ${seasonId}
+    ), category_by_game AS (
+      SELECT s.player_id, s.game_id, SUM(${valueExpression})::numeric AS value
+      FROM game_player_stats s
+      JOIN stat_terms st ON st.id = s.term_id
+      JOIN games g ON g.id = s.game_id
+      WHERE g.season_id = ${seasonId}
+      GROUP BY s.player_id, s.game_id
+    )
+    SELECT a.player_id AS "playerId", p.name, p.surname,
+      ROUND(COALESCE(SUM(c.value), 0) / COUNT(*)::numeric, 1)::float AS value,
+      COUNT(*)::int AS games
+    FROM appearances a
+    JOIN players p ON p.id = a.player_id
+    LEFT JOIN category_by_game c ON c.player_id = a.player_id AND c.game_id = a.game_id
+    GROUP BY a.player_id, p.name, p.surname
+    HAVING COUNT(*) >= ${minimumGames}
     ORDER BY value DESC LIMIT ${limit}`);
 }
 
 export async function getLeaders(seasonId: string, limit = 5): Promise<Leaders> {
-  // PTS is derived; compute per-game from atomic made-shots.
-  const ptsRows = await q<LeaderRow>(sql`
-    SELECT s.player_id AS "playerId", p.name, p.surname,
-      ROUND(SUM(CASE WHEN st.unique_name='BSKT_2PTM' THEN 2*s.value
-                     WHEN st.unique_name='BSKT_3PTM' THEN 3*s.value
-                     WHEN st.unique_name='BSKT_FTM' THEN s.value ELSE 0 END)::numeric
-            / COUNT(DISTINCT s.game_id), 1)::float AS value,
-      COUNT(DISTINCT s.game_id)::int AS games
-    FROM game_player_stats s JOIN stat_terms st ON st.id = s.term_id
-    JOIN games g ON g.id = s.game_id JOIN players p ON p.id = s.player_id
-    WHERE g.season_id = ${seasonId}
-    GROUP BY s.player_id, p.name, p.surname
-    ORDER BY value DESC LIMIT ${limit}`);
-  const [reb, ast, stl, blk] = await Promise.all([
-    countingLeader(seasonId, "BSKT_TOTRB", limit),
-    countingLeader(seasonId, "BSKT_AS", limit),
-    countingLeader(seasonId, "BSKT_ST", limit),
-    countingLeader(seasonId, "BSKT_BS", limit),
-  ]);
-  return [
-    { category: "pts", label: "Points / game", rows: ptsRows },
-    { category: "reb", label: "Rebounds / game", rows: reb },
-    { category: "ast", label: "Assists / game", rows: ast },
-    { category: "stl", label: "Steals / game", rows: stl },
-    { category: "blk", label: "Blocks / game", rows: blk },
-  ];
+  const eligibility = getLeaderEligibility();
+  const rows = await Promise.all(
+    LEADER_CATEGORIES.map((spec) =>
+      weightedLeader(seasonId, spec, eligibility.minimumGames, limit),
+    ),
+  );
+  return {
+    eligibility,
+    categories: LEADER_CATEGORIES.map((spec, index) => ({
+      category: spec.category,
+      label: spec.label,
+      rows: rows[index],
+    })),
+  };
 }
 
 // ---------------------------------------------------------------- team
@@ -192,8 +228,11 @@ export async function getTeamRoster(teamId: string, seasonId: string) {
   return q<{ playerId: string; name: string; surname: string | null; number: number | null; games: number }>(sql`
     SELECT r.player_id AS "playerId", p.name, p.surname,
       (ARRAY_AGG(r.number ORDER BY g.date DESC))[1] AS number,
-      COUNT(DISTINCT r.game_id)::int AS games
+      COUNT(DISTINCT a.game_id)::int AS games
     FROM game_rosters r JOIN games g ON g.id = r.game_id JOIN players p ON p.id = r.player_id
+    LEFT JOIN (
+      SELECT DISTINCT game_id, player_id, team_id FROM game_player_stats
+    ) a ON a.game_id = r.game_id AND a.player_id = r.player_id AND a.team_id = r.team_id
     WHERE r.team_id = ${teamId} AND g.season_id = ${seasonId}
     GROUP BY r.player_id, p.name, p.surname
     ORDER BY games DESC, number NULLS LAST`);
@@ -228,7 +267,8 @@ export async function getPlayerTeams(playerId: string, seasonId: string) {
     WHERE r.player_id = ${playerId} AND g.season_id = ${seasonId}`);
 }
 
-// player's per-game atomic counts → computed lines, for the game log + season total
+// Player games are recorded appearances: any player-stat event in the game. This excludes
+// roster-only/DNP records while retaining zeroes for categories with no event rows.
 export async function getPlayerStatRows(playerId: string, seasonId: string) {
   return q<{ gameId: string; date: string; uniqueName: string; value: number }>(sql`
     SELECT s.game_id AS "gameId", g.date::text AS date, st.unique_name AS "uniqueName", SUM(s.value)::int AS value

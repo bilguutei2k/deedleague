@@ -53,6 +53,8 @@ class NormalizedGame:
     # provenance / quality
     parse_failures: int
     orphan_stat_athletes: list[str]
+    fallback_resolved_athletes: list[str]
+    unknown_stat_terms: list[str]
     # coverage signals
     has_two_team_scores: bool
     has_score_values: bool
@@ -103,6 +105,7 @@ def normalize_game(pg: ParsedGame, active_members=None) -> NormalizedGame:
     # Primary = date-windowed active roster when supplied, else the nested roster.
     primary_team: dict[str, str] = {}
     primary_meta: dict[str, dict] = {}
+    fallback_resolved_athletes: set[str] = set()
     if active_members is not None:
         for am in active_members:
             primary_team[am.athlete_id] = am.team_id
@@ -110,6 +113,8 @@ def normalize_game(pg: ParsedGame, active_members=None) -> NormalizedGame:
                 "team_id": am.team_id, "number": am.number,
                 "name": am.name, "surname": am.surname, "image": am.image,
             }
+            if getattr(am, "resolution", "active") == "fallback":
+                fallback_resolved_athletes.add(am.athlete_id)
     else:
         primary_team = dict(nested_team)
         primary_meta = dict(nested_meta)
@@ -149,8 +154,13 @@ def normalize_game(pg: ParsedGame, active_members=None) -> NormalizedGame:
     team_counter: Counter[tuple[str, str, str | None]] = Counter()
     orphan_stat_athletes: set[str] = set()
     resolved_via_fallback: set[str] = set()
+    known_term_ids = {t.id for t in pg.terms}
+    unknown_stat_terms: set[str] = set()
     for ev in pg.stats:
         term_id = ev.term.id
+        if term_id not in known_term_ids:
+            unknown_stat_terms.add(term_id)
+            continue
         period_id = ev.periodId  # None => unknown-period bucket
         if ev.athleteId:
             team_id = primary_team.get(ev.athleteId)
@@ -158,6 +168,7 @@ def normalize_game(pg: ParsedGame, active_members=None) -> NormalizedGame:
                 team_id = nested_team.get(ev.athleteId)
                 if team_id:
                     resolved_via_fallback.add(ev.athleteId)
+                    fallback_resolved_athletes.add(ev.athleteId)
             if not team_id:
                 orphan_stat_athletes.add(ev.athleteId)
                 continue
@@ -261,6 +272,8 @@ def normalize_game(pg: ParsedGame, active_members=None) -> NormalizedGame:
         content_hash=content_hash,
         parse_failures=pg.parse_failures,
         orphan_stat_athletes=sorted(orphan_stat_athletes),
+        fallback_resolved_athletes=sorted(fallback_resolved_athletes),
+        unknown_stat_terms=sorted(unknown_stat_terms),
         has_two_team_scores=has_two_team_scores,
         has_score_values=has_score_values,
         has_roster=has_roster,

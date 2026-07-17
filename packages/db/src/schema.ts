@@ -40,7 +40,7 @@ export const sourceRecords = pgTable("source_records", {
   parserVersion: text("parser_version"),
   entityType: text("entity_type"), // 'game' in v1
   entityId: text("entity_id"),
-  // pending | loaded | failed
+  // pending | loaded | unchanged | partial | failed
   loadStatus: text("load_status").notNull().default("pending"),
 });
 

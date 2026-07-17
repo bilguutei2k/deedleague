@@ -6,12 +6,13 @@ import {
   getTeamGames,
   getTeamRoster,
   getTeamRollingDiff,
-  getCurrentSeasonId,
-  getSeasons,
+  getSeasonContext,
 } from "@deedleague/db";
 import { SeasonSelector } from "@/components/SeasonSelector";
 import { StatChart } from "@/components/StatChart";
+import { EmptySeasonState } from "@/components/EmptySeasonState";
 import { displayName, fmtDate } from "@/lib/format";
+import { withSeason } from "@/lib/season";
 
 export const dynamic = "force-dynamic";
 
@@ -24,13 +25,15 @@ export default async function TeamPage({
 }) {
   const { teamId } = await params;
   const sp = await searchParams;
-  const [team, seasons, currentId] = await Promise.all([
+  const [team, context] = await Promise.all([
     getTeam(teamId),
-    getSeasons(),
-    getCurrentSeasonId(),
+    getSeasonContext(sp.season),
   ]);
   if (!team) notFound();
-  const seasonId = sp.season ?? currentId;
+  if (context.resolution.status === "invalid") notFound();
+  if (context.resolution.status === "empty") return <EmptySeasonState />;
+  const seasons = context.seasons;
+  const seasonId = context.resolution.seasonId;
   const [standing, games, roster, diff] = await Promise.all([
     getTeamStanding(teamId, seasonId),
     getTeamGames(teamId, seasonId),
@@ -60,28 +63,31 @@ export default async function TeamPage({
       <div className="grid gap-8 md:grid-cols-2">
         <section>
           <h2 className="mb-2 text-lg font-semibold">Roster</h2>
-          <table className="w-full border-collapse text-sm">
-            <thead>
-              <tr className="border-b border-gray-300 text-left text-gray-500">
-                <th className="py-1 pr-2">#</th>
-                <th className="pr-2">Player</th>
-                <th className="px-2 text-right">GP</th>
-              </tr>
-            </thead>
-            <tbody>
-              {roster.map((p) => (
-                <tr key={p.playerId} className="border-b border-gray-100">
-                  <td className="py-1 pr-2 tabular-nums text-gray-500">{p.number ?? "—"}</td>
-                  <td className="pr-2">
-                    <Link href={`/players/${p.playerId}?season=${seasonId}`} className="hover:underline">
-                      {displayName(p.name, p.surname)}
-                    </Link>
-                  </td>
-                  <td className="px-2 text-right">{p.games}</td>
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse text-sm">
+              <caption className="sr-only">Team roster and recorded appearances</caption>
+              <thead>
+                <tr className="border-b border-gray-300 text-left text-gray-500">
+                  <th scope="col" className="py-1 pr-2">#</th>
+                  <th scope="col" className="pr-2">Player</th>
+                  <th scope="col" className="px-2 text-right">GP</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {roster.map((p) => (
+                  <tr key={p.playerId} className="border-b border-gray-100">
+                    <td className="py-1 pr-2 tabular-nums text-gray-500">{p.number ?? "—"}</td>
+                    <td className="pr-2">
+                      <Link href={withSeason(`/players/${p.playerId}`, seasonId)} className="hover:underline">
+                        {displayName(p.name, p.surname)}
+                      </Link>
+                    </td>
+                    <td className="px-2 text-right">{p.games}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </section>
 
         <section>
@@ -89,7 +95,7 @@ export default async function TeamPage({
           <ul className="divide-y divide-gray-100 text-sm">
             {games.map((g) => (
               <li key={g.gameId} className="py-1.5">
-                <Link href={`/games/${g.gameId}`} className="flex items-center gap-2 hover:underline">
+                <Link href={withSeason(`/games/${g.gameId}`, seasonId)} className="flex items-center gap-2 hover:underline">
                   <span className="w-20 shrink-0 text-gray-500">{fmtDate(g.date)}</span>
                   <span className="w-6">{g.isWinner === null ? "" : g.isWinner ? "W" : "L"}</span>
                   <span className="tabular-nums">

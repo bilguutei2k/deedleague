@@ -106,6 +106,7 @@ def load_game(
     source_record_id: str,
     *,
     changed: bool,
+    load_status: str = "loaded",
 ) -> None:
     """Load one normalized game in a single transaction. Raises on failure
     (caller marks the source_record failed)."""
@@ -192,8 +193,8 @@ def load_game(
 
             # Final write in the same transaction: 'loaded' commits atomically with data.
             cur.execute(
-                "UPDATE source_records SET load_status = 'loaded' WHERE id = %s",
-                (source_record_id,),
+                "UPDATE source_records SET load_status = %s WHERE id = %s",
+                (load_status, source_record_id),
             )
         conn.commit()
     except Exception:

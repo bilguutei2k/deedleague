@@ -98,6 +98,47 @@ def set_load_status(conn: psycopg.Connection, source_record_id: str, status: str
     conn.commit()
 
 
+def create_scrape_run(conn: psycopg.Connection, mode: str) -> str:
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO scrape_runs (mode, status) VALUES (%s, 'running') RETURNING id",
+            (mode,),
+        )
+        run_id = cur.fetchone()[0]
+    conn.commit()
+    return str(run_id)
+
+
+def finalize_scrape_run(
+    conn: psycopg.Connection,
+    run_id: str,
+    *,
+    status: str,
+    games_checked: int,
+    games_changed: int,
+    notes: str | None,
+) -> None:
+    """Persist one terminal run state. Callers are responsible for choosing the state."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE scrape_runs
+                SET finished_at = now(), games_checked = %s, games_changed = %s,
+                    status = %s, notes = %s
+                WHERE id = %s
+                """,
+                (games_checked, games_changed, status, notes, run_id),
+            )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+
+
 def get_existing_games(conn: psycopg.Connection) -> dict[str, dict]:
     """game_id -> {is_ended, last_changed_at, date, content_hash} for selection + change
     detection. Read once at the start of a run."""
@@ -116,7 +157,13 @@ def get_existing_games(conn: psycopg.Connection) -> dict[str, dict]:
         }
 
 
-def touch_last_fetched(conn: psycopg.Connection, game_id: str, source_record_id: str) -> None:
+def touch_last_fetched(
+    conn: psycopg.Connection,
+    game_id: str,
+    source_record_id: str,
+    *,
+    load_status: str = "unchanged",
+) -> None:
     """Unchanged game: only bump last_fetched_at; do NOT touch normalized rows,
     last_changed_at, or games.source_record_id (which points to the last loading fetch)."""
     with conn.cursor() as cur:
@@ -124,7 +171,7 @@ def touch_last_fetched(conn: psycopg.Connection, game_id: str, source_record_id:
             "UPDATE games SET last_fetched_at = now() WHERE id = %s", (game_id,)
         )
         cur.execute(
-            "UPDATE source_records SET load_status = 'unchanged' WHERE id = %s",
-            (source_record_id,),
+            "UPDATE source_records SET load_status = %s WHERE id = %s",
+            (load_status, source_record_id),
         )
     conn.commit()
