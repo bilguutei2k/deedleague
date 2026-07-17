@@ -165,10 +165,17 @@ Incremental ingestion runs every four hours at minute 17. Full resync runs Sunda
 concurrency group, so two writers never overlap.
 
 Repository configuration requires the least-privilege `PIPELINE_DATABASE_URL` Actions
-secret. `MSPORTS_GRAPHQL_URL` is an optional Actions variable. Incremental snapshots and
-logs are retained for 30 days; full-resync artifacts are retained for 90 days. The database
-reference uses the `github-actions://` scheme and remains resolvable for that retention
-window. Recovery after expiry is a full resync.
+secret. `MSPORTS_GRAPHQL_URL` is an optional Actions variable. Scheduled jobs remain skipped
+until the repository variable `INGESTION_ENABLED` is exactly `true`; manual dispatch bypasses
+that variable for supervised activation tests. Incremental snapshots and logs are retained
+for 30 days; full-resync artifacts are retained for 90 days. The database reference uses the
+`github-actions://` scheme and remains resolvable for that retention window. Recovery after
+expiry is a full resync.
+
+For first activation, provision and verify database roles, configure the writer secret,
+enable the two workflows in GitHub, and manually validate incremental and full-resync runs.
+Set `INGESTION_ENABLED=true` only after both manual runs pass. Removing or changing the
+variable stops future scheduled jobs without removing manual recovery access.
 
 An incremental failure opens a GitHub issue after two consecutive failed workflow runs.
 A full-resync failure opens an issue immediately. The next successful run comments on and
